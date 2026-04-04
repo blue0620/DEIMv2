@@ -16,6 +16,7 @@ import copy
 
 from .dfine_utils import bbox2distance
 from .box_ops import box_cxcywh_to_xyxy, box_iou, generalized_box_iou
+from .obb_ops import probiou_obb, normalize_angle_half_pi, obb_cxcywha_to_corners
 from ..misc.dist_utils import get_world_size, is_dist_available_and_initialized
 from ..core import register
 
@@ -39,6 +40,9 @@ class DEIMCriterion(nn.Module):
         share_matched_indices=False,
         mal_alpha=None,
         use_uni_set=True,
+        use_obb=False,
+        angle_weight=1.0,
+        corner_weight=0.2,
         ):
         """Create the criterion.
         Parameters:
@@ -64,6 +68,9 @@ class DEIMCriterion(nn.Module):
         self.num_pos, self.num_neg = None, None
         self.mal_alpha = mal_alpha
         self.use_uni_set = use_uni_set
+        self.use_obb = use_obb
+        self.angle_weight = angle_weight
+        self.corner_weight = corner_weight
 
     def loss_labels_focal(self, outputs, targets, indices, num_boxes):
         assert 'pred_logits' in outputs
@@ -83,10 +90,15 @@ class DEIMCriterion(nn.Module):
         assert 'pred_boxes' in outputs
         idx = self._get_src_permutation_idx(indices)
         if values is None:
-            src_boxes = outputs['pred_boxes'][idx]
-            target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
-            ious, _ = box_iou(box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes))
-            ious = torch.diag(ious).detach()
+            if self.use_obb and ('pred_rboxes' in outputs) and all('rboxes' in t for t in targets):
+                src_rboxes = outputs['pred_rboxes'][idx]
+                target_rboxes = torch.cat([t['rboxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+                ious = torch.diag(probiou_obb(src_rboxes, target_rboxes)).detach()
+            else:
+                src_boxes = outputs['pred_boxes'][idx]
+                target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+                ious, _ = box_iou(box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes))
+                ious = torch.diag(ious).detach()
         else:
             ious = values
 
@@ -112,10 +124,15 @@ class DEIMCriterion(nn.Module):
         assert 'pred_boxes' in outputs
         idx = self._get_src_permutation_idx(indices)
         if values is None:
-            src_boxes = outputs['pred_boxes'][idx]
-            target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
-            ious, _ = box_iou(box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes))
-            ious = torch.diag(ious).detach()
+            if self.use_obb and ('pred_rboxes' in outputs) and all('rboxes' in t for t in targets):
+                src_rboxes = outputs['pred_rboxes'][idx]
+                target_rboxes = torch.cat([t['rboxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+                ious = torch.diag(probiou_obb(src_rboxes, target_rboxes)).detach()
+            else:
+                src_boxes = outputs['pred_boxes'][idx]
+                target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+                ious, _ = box_iou(box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes))
+                ious = torch.diag(ious).detach()
         else:
             ious = values
 
@@ -152,13 +169,31 @@ class DEIMCriterion(nn.Module):
         src_boxes = outputs['pred_boxes'][idx]
         target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
         losses = {}
-        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
-        losses['loss_bbox'] = loss_bbox.sum() / num_boxes
+        use_obb = self.use_obb and ('pred_rboxes' in outputs) and all('rboxes' in t for t in targets)
 
-        loss_giou = 1 - torch.diag(generalized_box_iou(\
-            box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes)))
-        loss_giou = loss_giou if boxes_weight is None else loss_giou * boxes_weight
-        losses['loss_giou'] = loss_giou.sum() / num_boxes
+        if use_obb:
+            src_rboxes = outputs['pred_rboxes'][idx]
+            target_rboxes = torch.cat([t['rboxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+
+            l1_xywh = F.l1_loss(src_rboxes[:, :4], target_rboxes[:, :4], reduction='none').sum(-1)
+            angle_delta = normalize_angle_half_pi(src_rboxes[:, 4] - target_rboxes[:, 4]).abs()
+            losses['loss_bbox'] = (l1_xywh + self.angle_weight * angle_delta).sum() / num_boxes
+
+            loss_giou = 1 - torch.diag(probiou_obb(src_rboxes, target_rboxes))
+            loss_giou = loss_giou if boxes_weight is None else loss_giou * boxes_weight
+            losses['loss_giou'] = loss_giou.sum() / num_boxes
+
+            src_corners = obb_cxcywha_to_corners(src_rboxes)
+            tgt_corners = obb_cxcywha_to_corners(target_rboxes)
+            losses['loss_obb_corner'] = F.smooth_l1_loss(src_corners, tgt_corners, reduction='sum') / num_boxes * self.corner_weight
+        else:
+            loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
+            losses['loss_bbox'] = loss_bbox.sum() / num_boxes
+
+            loss_giou = 1 - torch.diag(generalized_box_iou(\
+                box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes)))
+            loss_giou = loss_giou if boxes_weight is None else loss_giou * boxes_weight
+            losses['loss_giou'] = loss_giou.sum() / num_boxes
 
         return losses
 

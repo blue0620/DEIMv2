@@ -1,0 +1,27 @@
+__include__: [
+  '../dataset/custom_detection.yml',
+  '../runtime.yml',
+  '../base/dataloader.yml',
+  '../base/optimizer.yml',
+  '../base/deimv2.yml'
+]
+
+output_dir: ./outputs/deimv2_hgnetv2_s_custom_obb
+
+DEIMTransformer:
+  num_layers: 3
+  eval_idx: -1
+  use_obb: True
+
+DEIMCriterion:
+  use_obb: True
+  weight_dict: {loss_mal: 1, loss_bbox: 5, loss_giou: 2, loss_obb_corner: 0.5, loss_fgl: 0.15, loss_ddf: 1.5}
+  matcher:
+    use_obb: True
+    cost_angle: 1.0
+
+train_dataloader:
+  dataset:
+    transforms:
+      ops:
+        - {type: ConvertOBB, normalize: True}
