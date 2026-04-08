@@ -13,6 +13,7 @@ from scipy.optimize import linear_sum_assignment
 from typing import Dict
 
 from .box_ops import box_cxcywh_to_xyxy, generalized_box_iou, box_iou
+from .obb_ops import probiou_obb, normalize_angle_half_pi
 
 from ..core import register
 import numpy as np
@@ -30,7 +31,8 @@ class HungarianMatcher(nn.Module):
     __share__ = ['use_focal_loss', ]
 
     def __init__(self, weight_dict, use_focal_loss=False, alpha=0.25, gamma=2.0,
-                change_matcher=False, iou_order_alpha=1.0, matcher_change_epoch=10000):
+                change_matcher=False, iou_order_alpha=1.0, matcher_change_epoch=10000,
+                use_obb=False, cost_angle=1.0):
         """Creates the matcher
 
         Params:
@@ -50,6 +52,8 @@ class HungarianMatcher(nn.Module):
             print(f"Using the new matching cost with iou_order_alpha = {iou_order_alpha} at epoch {matcher_change_epoch}")
 
         self.use_focal_loss = use_focal_loss
+        self.use_obb = use_obb
+        self.cost_angle = cost_angle
         self.alpha = alpha
         self.gamma = gamma
 
@@ -90,6 +94,11 @@ class HungarianMatcher(nn.Module):
         tgt_ids = torch.cat([v["labels"] for v in targets])
         tgt_bbox = torch.cat([v["boxes"] for v in targets])
 
+        use_obb = self.use_obb and ('pred_rboxes' in outputs) and all('rboxes' in t for t in targets)
+        if use_obb:
+            out_rbbox = outputs['pred_rboxes'].flatten(0, 1)
+            tgt_rbbox = torch.cat([v['rboxes'] for v in targets])
+
         if self.change_matcher and epoch >= self.matcher_change_epoch:
             # Compute the class_score
             class_score = out_prob[:, tgt_ids]  # shape = [batch_size * num_queries, gt num within a batch]
@@ -114,11 +123,17 @@ class HungarianMatcher(nn.Module):
             # Compute the L1 cost between boxes
             cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
 
-            # Compute the giou cost betwen boxes
-            cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
+            if use_obb:
+                cost_bbox = torch.cdist(out_rbbox[:, :4], tgt_rbbox[:, :4], p=1)
+                angle_delta = normalize_angle_half_pi(out_rbbox[:, None, 4] - tgt_rbbox[None, :, 4]).abs()
+                cost_giou = -probiou_obb(out_rbbox, tgt_rbbox)
+                C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou + self.cost_angle * angle_delta
+            else:
+                # Compute the giou cost betwen boxes
+                cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
 
-            # Final cost matrix 3 * self.cost_bbox + 2 * self.cost_class + self.cost_giou
-            C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
+                # Final cost matrix 3 * self.cost_bbox + 2 * self.cost_class + self.cost_giou
+                C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
 
         C = C.view(bs, num_queries, -1).cpu()
 

@@ -135,3 +135,23 @@ class ConvertPILImage(T.Transform):
         inpt = Image(inpt)
 
         return inpt
+
+
+@register()
+class ConvertOBB(T.Transform):
+    def __init__(self, normalize=True) -> None:
+        super().__init__()
+        self.normalize = normalize
+
+    def __call__(self, *inputs: Any) -> Any:
+        outputs = super().forward(*inputs)
+        if not isinstance(outputs, (tuple, list)) or len(outputs) < 2 or not isinstance(outputs[1], dict):
+            return outputs
+
+        image, target = outputs[0], outputs[1]
+        if 'rboxes' in target and self.normalize:
+            h, w = F.get_spatial_size(image)
+            scale = torch.tensor([w, h, w, h, 1.0], dtype=target['rboxes'].dtype, device=target['rboxes'].device)
+            target['rboxes'] = target['rboxes'] / scale
+
+        return outputs

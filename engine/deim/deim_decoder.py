@@ -24,6 +24,7 @@ from .utils import deformable_attention_core_func_v2, get_activation, inverse_si
 from .dfine_decoder import MSDeformableAttention, LQE, Integral
 from .dfine_utils import weighting_function, distance2bbox
 from .deim_utils import RMSNorm, SwiGLUFFN, Gate, MLP
+from .obb_ops import normalize_angle_half_pi
 
 __all__ = ['DEIMTransformer']
 
@@ -169,6 +170,7 @@ class TransformerDecoder(nn.Module):
         dec_out_logits = []
         dec_out_pred_corners = []
         dec_out_refs = []
+        dec_out_feats = []
         if not hasattr(self, 'project'):
             project = weighting_function(self.reg_max, up, reg_scale)
         else:
@@ -206,6 +208,7 @@ class TransformerDecoder(nn.Module):
                 dec_out_bboxes.append(inter_ref_bbox)
                 dec_out_pred_corners.append(pred_corners)
                 dec_out_refs.append(ref_points_initial)
+                dec_out_feats.append(output)
 
                 if not self.training:
                     break
@@ -215,7 +218,8 @@ class TransformerDecoder(nn.Module):
             output_detach = output.detach()
 
         return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits), \
-               torch.stack(dec_out_pred_corners), torch.stack(dec_out_refs), pre_bboxes, pre_scores
+               torch.stack(dec_out_pred_corners), torch.stack(dec_out_refs), torch.stack(dec_out_feats), \
+               pre_bboxes, pre_scores
 
 
 @register()
@@ -252,6 +256,7 @@ class DEIMTransformer(nn.Module):
                  use_gateway=True,
                  share_bbox_head=False,
                  share_score_head=False,
+                 use_obb=False,
                  ):
         super().__init__()
         assert len(feat_channels) <= num_levels
@@ -272,6 +277,7 @@ class DEIMTransformer(nn.Module):
         self.eval_spatial_size = eval_spatial_size
         self.aux_loss = aux_loss
         self.reg_max = reg_max
+        self.use_obb = use_obb
 
         assert query_select_method in ('default', 'one2many', 'agnostic'), ''
         assert cross_attn_method in ('default', 'discrete'), ''
@@ -317,6 +323,11 @@ class DEIMTransformer(nn.Module):
 
         # decoder head
         self.pre_bbox_head = MLP(hidden_dim, hidden_dim, 4, 3, act=mlp_act)
+        if self.use_obb:
+            self.pre_angle_head = MLP(hidden_dim, hidden_dim, 1, 3, act=mlp_act)
+            self.dec_angle_head = nn.ModuleList(
+                [MLP(hidden_dim, hidden_dim, 1, 3, act=mlp_act) for _ in range(self.eval_idx + 1)]
+              + [MLP(scaled_dim, scaled_dim, 1, 3, act=mlp_act) for _ in range(num_layers - self.eval_idx - 1)])
         self.integral = Integral(self.reg_max)
 
         self.eval_idx = eval_idx if eval_idx >= 0 else num_layers + eval_idx
@@ -357,12 +368,19 @@ class DEIMTransformer(nn.Module):
 
         init.constant_(self.pre_bbox_head.layers[-1].weight, 0)
         init.constant_(self.pre_bbox_head.layers[-1].bias, 0)
+        if self.use_obb:
+            init.constant_(self.pre_angle_head.layers[-1].weight, 0)
+            init.constant_(self.pre_angle_head.layers[-1].bias, 0)
 
         for cls_, reg_ in zip(self.dec_score_head, self.dec_bbox_head):
             init.constant_(cls_.bias, bias)
             if hasattr(reg_, 'layers'):
                 init.constant_(reg_.layers[-1].weight, 0)
                 init.constant_(reg_.layers[-1].bias, 0)
+        if self.use_obb:
+            for reg_a in self.dec_angle_head:
+                init.constant_(reg_a.layers[-1].weight, 0)
+                init.constant_(reg_a.layers[-1].bias, 0)
 
         if self.learn_query_content:
             init.xavier_uniform_(self.tgt_embed.weight)
@@ -544,7 +562,7 @@ class DEIMTransformer(nn.Module):
             self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
 
         # decoder
-        out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits = self.decoder(
+        out_bboxes, out_logits, out_corners, out_refs, out_feats, pre_bboxes, pre_logits = self.decoder(
             init_ref_contents,
             init_ref_points_unact,
             memory,
@@ -558,6 +576,13 @@ class DEIMTransformer(nn.Module):
             self.reg_scale,
             attn_mask=attn_mask,
             dn_meta=dn_meta)
+        out_rboxes = pre_rboxes = None
+        if self.use_obb:
+            pre_angles = normalize_angle_half_pi(self.pre_angle_head(init_ref_contents)).squeeze(-1)
+            out_angles = torch.stack([normalize_angle_half_pi(self.dec_angle_head[i](out_feats[i]).squeeze(-1))
+                                      for i in range(out_feats.shape[0])])
+            pre_rboxes = torch.cat([pre_bboxes, pre_angles.unsqueeze(-1)], dim=-1)
+            out_rboxes = torch.cat([out_bboxes, out_angles.unsqueeze(-1)], dim=-1)
 
         if self.training and dn_meta is not None:
             # the output from the first decoder layer, only one
@@ -569,24 +594,35 @@ class DEIMTransformer(nn.Module):
 
             dn_out_corners, out_corners = torch.split(out_corners, dn_meta['dn_num_split'], dim=2)
             dn_out_refs, out_refs = torch.split(out_refs, dn_meta['dn_num_split'], dim=2)
+            if self.use_obb:
+                dn_out_rboxes, out_rboxes = torch.split(out_rboxes, dn_meta['dn_num_split'], dim=2)
+                dn_pre_rboxes, pre_rboxes = torch.split(pre_rboxes, dn_meta['dn_num_split'], dim=1)
 
         if self.training:
             out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1], 'pred_corners': out_corners[-1],
                    'ref_points': out_refs[-1], 'up': self.up, 'reg_scale': self.reg_scale}
         else:
             out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1]}
+        if self.use_obb:
+            out['pred_rboxes'] = out_rboxes[-1]
 
         if self.training and self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss2(out_logits[:-1], out_bboxes[:-1], out_corners[:-1], out_refs[:-1],
-                                                     out_corners[-1], out_logits[-1])
+                                                     out_corners[-1], out_logits[-1],
+                                                     out_rboxes[:-1] if self.use_obb else None)
             out['enc_aux_outputs'] = self._set_aux_loss(enc_topk_logits_list, enc_topk_bboxes_list)
             out['pre_outputs'] = {'pred_logits': pre_logits, 'pred_boxes': pre_bboxes}
+            if self.use_obb:
+                out['pre_outputs']['pred_rboxes'] = pre_rboxes
             out['enc_meta'] = {'class_agnostic': self.query_select_method == 'agnostic'}
 
             if dn_meta is not None:
                 out['dn_outputs'] = self._set_aux_loss2(dn_out_logits, dn_out_bboxes, dn_out_corners, dn_out_refs,
-                                                        dn_out_corners[-1], dn_out_logits[-1])
+                                                        dn_out_corners[-1], dn_out_logits[-1],
+                                                        dn_out_rboxes if self.use_obb else None)
                 out['dn_pre_outputs'] = {'pred_logits': dn_pre_logits, 'pred_boxes': dn_pre_bboxes}
+                if self.use_obb:
+                    out['dn_pre_outputs']['pred_rboxes'] = dn_pre_rboxes
                 out['dn_meta'] = dn_meta
 
         return out
@@ -602,10 +638,14 @@ class DEIMTransformer(nn.Module):
 
     @torch.jit.unused
     def _set_aux_loss2(self, outputs_class, outputs_coord, outputs_corners, outputs_ref,
-                       teacher_corners=None, teacher_logits=None):
+                       teacher_corners=None, teacher_logits=None, outputs_rboxes=None):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
-        return [{'pred_logits': a, 'pred_boxes': b, 'pred_corners': c, 'ref_points': d,
+        aux = [{'pred_logits': a, 'pred_boxes': b, 'pred_corners': c, 'ref_points': d,
                      'teacher_corners': teacher_corners, 'teacher_logits': teacher_logits}
                 for a, b, c, d in zip(outputs_class, outputs_coord, outputs_corners, outputs_ref)]
+        if outputs_rboxes is not None:
+            for i in range(len(aux)):
+                aux[i]['pred_rboxes'] = outputs_rboxes[i]
+        return aux

@@ -11,6 +11,7 @@ import torch.utils.data
 import torchvision
 
 from PIL import Image
+import math
 import faster_coco_eval
 import faster_coco_eval.core.mask as coco_mask
 from ._dataset import DetDataset
@@ -20,6 +21,10 @@ from ...core import register
 torchvision.disable_beta_transforms_warning()
 faster_coco_eval.init_as_pycocotools()
 Image.MAX_IMAGE_PIXELS = None
+
+
+def _normalize_angle_half_pi(angle: torch.Tensor) -> torch.Tensor:
+    return torch.remainder(angle + math.pi / 2, math.pi) - math.pi / 2
 
 __all__ = ['CocoDetection']
 
@@ -127,6 +132,25 @@ class ConvertCocoPolysToMask(object):
         boxes[:, 2:] += boxes[:, :2]
         boxes[:, 0::2].clamp_(min=0, max=w)
         boxes[:, 1::2].clamp_(min=0, max=h)
+        rboxes = []
+        has_rbox = False
+        for obj in anno:
+            rb = obj.get("rbox", obj.get("obb", None))
+            if rb is None:
+                rboxes.append([0.0, 0.0, 0.0, 0.0, 0.0])
+            else:
+                has_rbox = True
+                angle = float(rb[4])
+                if abs(angle) > math.pi:
+                    angle = angle * math.pi / 180.0
+                rboxes.append([float(rb[0]), float(rb[1]), float(rb[2]), float(rb[3]), angle])
+        if has_rbox:
+            rboxes = torch.as_tensor(rboxes, dtype=torch.float32).reshape(-1, 5)
+            rboxes[:, 0].clamp_(min=0, max=w)
+            rboxes[:, 1].clamp_(min=0, max=h)
+            rboxes[:, 2].clamp_(min=0, max=w)
+            rboxes[:, 3].clamp_(min=0, max=h)
+            rboxes[:, 4] = _normalize_angle_half_pi(rboxes[:, 4])
 
         category2label = kwargs.get('category2label', None)
         if category2label is not None:
@@ -151,6 +175,8 @@ class ConvertCocoPolysToMask(object):
         keep = (boxes[:, 3] > boxes[:, 1]) & (boxes[:, 2] > boxes[:, 0])
         boxes = boxes[keep]
         labels = labels[keep]
+        if has_rbox:
+            rboxes = rboxes[keep]
         if self.return_masks:
             masks = masks[keep]
         if keypoints is not None:
@@ -159,6 +185,8 @@ class ConvertCocoPolysToMask(object):
         target = {}
         target["boxes"] = boxes
         target["labels"] = labels
+        if has_rbox:
+            target["rboxes"] = rboxes
         if self.return_masks:
             target["masks"] = masks
         target["image_id"] = image_id

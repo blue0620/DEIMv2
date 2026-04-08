@@ -258,6 +258,34 @@ To train on your custom dataset, you need to organize it in the COCO format. Fol
         img_folder: /data/yourdataset/train
         ann_file: /data/yourdataset/train/train.json
         return_masks: False
+
+5. **(Optional) Enable OBB (oriented bounding boxes):**
+
+    This repository now supports OBB training/inference with rotated boxes in `cx, cy, w, h, angle` format.  
+    Put per-instance OBB in COCO annotations as `rbox` (or `obb`), where angle can be in radians or degrees.
+
+    ```yaml
+    DEIMTransformer:
+      use_obb: True
+
+    DEIMCriterion:
+      use_obb: True
+      weight_dict: {loss_mal: 1, loss_bbox: 5, loss_giou: 2, loss_obb_corner: 0.5, loss_fgl: 0.15, loss_ddf: 1.5}
+      matcher:
+        type: HungarianMatcher
+        use_obb: True
+        cost_angle: 1.0
+
+    train_dataloader:
+      dataset:
+        transforms:
+          ops:
+            - {type: ConvertOBB, normalize: True}
+    ```
+
+    In OBB mode, the model outputs:
+    - `pred_rboxes`: rotated boxes in normalized `cxcywha`
+    - postprocessor results with `rboxes` and `obb_corners` (pixel coordinates)
         transforms:
           type: Compose
           ops: ~
