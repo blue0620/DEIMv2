@@ -320,6 +320,7 @@ class DEIMTransformer(nn.Module):
         self.enc_bbox_head = MLP(hidden_dim, hidden_dim, 4, 3, act=mlp_act)
 
         self.query_pos_head = MLP(4, hidden_dim, hidden_dim, 3, act=mlp_act)
+        self.eval_idx = eval_idx if eval_idx >= 0 else num_layers + eval_idx
 
         # decoder head
         self.pre_bbox_head = MLP(hidden_dim, hidden_dim, 4, 3, act=mlp_act)
@@ -330,7 +331,6 @@ class DEIMTransformer(nn.Module):
               + [MLP(scaled_dim, scaled_dim, 1, 3, act=mlp_act) for _ in range(num_layers - self.eval_idx - 1)])
         self.integral = Integral(self.reg_max)
 
-        self.eval_idx = eval_idx if eval_idx >= 0 else num_layers + eval_idx
         dec_score_head = nn.Linear(hidden_dim, num_classes)
         self.dec_score_head = nn.ModuleList(
             [dec_score_head if share_score_head else copy.deepcopy(dec_score_head) for _ in range(self.eval_idx + 1)]
