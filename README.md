@@ -261,8 +261,10 @@ To train on your custom dataset, you need to organize it in the COCO format. Fol
 
 5. **(Optional) Enable OBB (oriented bounding boxes):**
 
-    This repository now supports OBB training/inference with rotated boxes in `cx, cy, w, h, angle` format.  
-    Put per-instance OBB in COCO annotations as `rbox` (or `obb`), where angle can be in radians or degrees.
+    This repository supports OBB training/inference with rotated boxes in `cx, cy, w, h, angle` format.
+    You can use either:
+    - per-instance OBB in COCO annotations as `rbox` (or `obb`), where angle can be in radians or degrees, or
+    - standard COCO `bbox` only, and generate synthetic rotated OBB at training time via augmentation.
 
     ```yaml
     DEIMTransformer:
@@ -280,6 +282,9 @@ To train on your custom dataset, you need to organize it in the COCO format. Fol
       dataset:
         transforms:
           ops:
+            # For plain COCO bbox-only annotations:
+            - {type: RandomRotateAABBToOBB, max_angle: 45.0, p: 1.0}
+            # Always keep this to normalize cxcywha:
             - {type: ConvertOBB, normalize: True}
     ```
 
