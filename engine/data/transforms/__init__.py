@@ -17,6 +17,8 @@ from ._transforms import (
     Normalize,
     ConvertBoxes,
     ConvertPILImage,
+    ConvertOBB,
+    RandomRotateAABBToOBB,
 )
 from .container import Compose
 from .mosaic import Mosaic

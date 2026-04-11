@@ -24,4 +24,5 @@ train_dataloader:
   dataset:
     transforms:
       ops:
+        - {type: RandomRotateAABBToOBB, max_angle: 45.0, p: 1.0, overwrite: False}
         - {type: ConvertOBB, normalize: True}

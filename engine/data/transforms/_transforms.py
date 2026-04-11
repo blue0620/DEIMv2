@@ -5,6 +5,7 @@ Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 
 import torch
 import torch.nn as nn
+import math
 
 import torchvision
 import torchvision.transforms.v2 as T
@@ -55,7 +56,7 @@ class PadToSize(T.Pad):
         BoundingBoxes,
     )
     def _get_params(self, flat_inputs: List[Any]) -> Dict[str, Any]:
-        sp = F.get_spatial_size(flat_inputs[0])
+        sp = F.get_size(flat_inputs[0])
         h, w = self.size[1] - sp[0], self.size[0] - sp[1]
         self.padding = [0, 0, w, h]
         return dict(padding=self.padding)
@@ -144,14 +145,60 @@ class ConvertOBB(T.Transform):
         self.normalize = normalize
 
     def __call__(self, *inputs: Any) -> Any:
-        outputs = super().forward(*inputs)
+        outputs = inputs if len(inputs) > 1 else inputs[0]
         if not isinstance(outputs, (tuple, list)) or len(outputs) < 2 or not isinstance(outputs[1], dict):
             return outputs
 
         image, target = outputs[0], outputs[1]
         if 'rboxes' in target and self.normalize:
-            h, w = F.get_spatial_size(image)
+            h, w = F.get_size(image)
             scale = torch.tensor([w, h, w, h, 1.0], dtype=target['rboxes'].dtype, device=target['rboxes'].device)
             target['rboxes'] = target['rboxes'] / scale
 
+        return outputs
+
+
+@register()
+class RandomRotateAABBToOBB(T.Transform):
+    """Create OBB targets from AABB targets with random training-time rotation.
+
+    This transform is useful when the source annotation is standard COCO bbox
+    (xyxy) and no explicit `rboxes` are provided. It keeps the original `boxes`
+    untouched and writes `target['rboxes']` in pixel-space `cx, cy, w, h, angle(rad)`.
+    """
+
+    def __init__(self, max_angle: float = 45.0, p: float = 0.5, overwrite: bool = False) -> None:
+        super().__init__()
+        self.max_angle = float(max_angle)
+        self.p = float(p)
+        self.overwrite = overwrite
+
+    def __call__(self, *inputs: Any) -> Any:
+        outputs = inputs if len(inputs) > 1 else inputs[0]
+        if not isinstance(outputs, (tuple, list)) or len(outputs) < 2 or not isinstance(outputs[1], dict):
+            return outputs
+
+        target = outputs[1]
+        if 'boxes' not in target:
+            return outputs
+        if ('rboxes' in target) and (not self.overwrite):
+            return outputs
+
+        boxes = target['boxes']
+        if boxes.numel() == 0:
+            target['rboxes'] = torch.zeros((0, 5), dtype=boxes.dtype, device=boxes.device)
+            return outputs
+
+        cx = (boxes[:, 0] + boxes[:, 2]) * 0.5
+        cy = (boxes[:, 1] + boxes[:, 3]) * 0.5
+        w = (boxes[:, 2] - boxes[:, 0]).clamp(min=1e-6)
+        h = (boxes[:, 3] - boxes[:, 1]).clamp(min=1e-6)
+
+        if torch.rand(1).item() < self.p:
+            angle_deg = (torch.rand((boxes.shape[0],), device=boxes.device, dtype=boxes.dtype) * 2.0 - 1.0) * self.max_angle
+            angle = angle_deg * (math.pi / 180.0)
+        else:
+            angle = torch.zeros((boxes.shape[0],), device=boxes.device, dtype=boxes.dtype)
+
+        target['rboxes'] = torch.stack([cx, cy, w, h, angle], dim=-1)
         return outputs
