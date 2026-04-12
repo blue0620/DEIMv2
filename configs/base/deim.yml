@@ -12,8 +12,10 @@ train_dataloader:
         - {type: RandomHorizontalFlip}
         - {type: Resize, size: [640, 640], }
         - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: RandomRotateOBB, degrees: 15.0, p: 0.5, fill: 0}
         - {type: ConvertPILImage, dtype: 'float32', scale: True}
         - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
+        - {type: ConvertOBB, normalize: True}
       policy:
         epoch: [4, 29, 50]   # list 
         ops: ['Mosaic', 'RandomPhotometricDistort', 'RandomZoomOut', 'RandomIoUCrop']
@@ -43,6 +45,6 @@ no_aug_epoch: 8
 
 ## Our Loss
 DEIMCriterion:
-  weight_dict: {loss_mal: 1, loss_bbox: 5, loss_giou: 2, loss_fgl: 0.15, loss_ddf: 1.5}
-  losses: ['mal', 'boxes', 'local']
+  weight_dict: {loss_mal: 1, loss_bbox: 5, loss_giou: 2, loss_obb: 2, loss_fgl: 0.15, loss_ddf: 1.5}
+  losses: ['mal', 'boxes', 'obb', 'local']
   gamma: 1.5

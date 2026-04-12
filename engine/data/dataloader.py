@@ -186,6 +186,10 @@ class BatchImageCollateFunction(BaseCollateFunction):
                 updated_targets[i]['boxes'] = torch.cat([targets[i]['boxes'], shifted_targets[i]['boxes']], dim=0)
                 updated_targets[i]['labels'] = torch.cat([targets[i]['labels'], shifted_targets[i]['labels']], dim=0)
                 updated_targets[i]['area'] = torch.cat([targets[i]['area'], shifted_targets[i]['area']], dim=0)
+                if 'obb_boxes' in targets[i] and 'obb_boxes' in shifted_targets[i]:
+                    updated_targets[i]['obb_boxes'] = torch.cat(
+                        [targets[i]['obb_boxes'], shifted_targets[i]['obb_boxes']], dim=0
+                    )
 
                 # Add mixup ratio to targets
                 updated_targets[i]['mixup'] = torch.tensor(
@@ -243,6 +247,7 @@ class BatchImageCollateFunction(BaseCollateFunction):
                 selected_indices = random.sample(range(len(objects_pool['boxes'])), num_objects)
                 
                 blend_boxes = []
+                blend_obb_boxes = []
                 blend_labels = []
                 blend_areas = []
                 blend_mixup_ratios = []
@@ -281,6 +286,7 @@ class BatchImageCollateFunction(BaseCollateFunction):
 
                     # add to blend list - use original unexpanded box
                     blend_boxes.append(torch.tensor([new_cx, new_cy, new_w, new_h]))
+                    blend_obb_boxes.append(torch.tensor([new_cx, new_cy, new_w, new_h, 0.0]))
                     blend_labels.append(label)
                     blend_areas.append(area)
                     # mixup ratio
@@ -321,6 +327,10 @@ class BatchImageCollateFunction(BaseCollateFunction):
                     )
                     # update targets
                     updated_targets[i]['boxes'] = torch.cat([updated_targets[i]['boxes'], blend_boxes])
+                    if 'obb_boxes' in updated_targets[i]:
+                        updated_targets[i]['obb_boxes'] = torch.cat(
+                            [updated_targets[i]['obb_boxes'], torch.stack(blend_obb_boxes)]
+                        )
                     updated_targets[i]['labels'] = torch.cat([updated_targets[i]['labels'], blend_labels])
                     updated_targets[i]['area'] = torch.cat([updated_targets[i]['area'], blend_areas])
 

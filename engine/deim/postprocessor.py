@@ -49,10 +49,16 @@ class PostProcessor(nn.Module):
     # def forward(self, outputs, orig_target_sizes):
     def forward(self, outputs, orig_target_sizes: torch.Tensor):
         logits, boxes = outputs['pred_logits'], outputs['pred_boxes']
+        obb_boxes = outputs.get('pred_obb_boxes', None)
         # orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
 
         bbox_pred = torchvision.ops.box_convert(boxes, in_fmt='cxcywh', out_fmt='xyxy')
         bbox_pred *= orig_target_sizes.repeat(1, 2).unsqueeze(1)
+        obb_pred, obb_points = None, None
+        if obb_boxes is not None:
+            scale = torch.cat([orig_target_sizes[:, [1, 0, 1, 0]], torch.ones_like(orig_target_sizes[:, :1])], dim=-1)
+            obb_pred = obb_boxes * scale.unsqueeze(1)
+            obb_points = self._obb_to_corners(obb_pred)
 
         if self.use_focal_loss:
             scores = F.sigmoid(logits)
@@ -61,6 +67,9 @@ class PostProcessor(nn.Module):
             labels = mod(index, self.num_classes)
             index = index // self.num_classes
             boxes = bbox_pred.gather(dim=1, index=index.unsqueeze(-1).repeat(1, 1, bbox_pred.shape[-1]))
+            if obb_pred is not None:
+                obb_pred = obb_pred.gather(dim=1, index=index.unsqueeze(-1).repeat(1, 1, obb_pred.shape[-1]))
+                obb_points = obb_points.gather(dim=1, index=index.unsqueeze(-1).unsqueeze(-1).repeat(1, 1, 4, 2))
 
         else:
             scores = F.softmax(logits)[:, :, :-1]
@@ -71,6 +80,8 @@ class PostProcessor(nn.Module):
                 boxes = torch.gather(boxes, dim=1, index=index.unsqueeze(-1).tile(1, 1, boxes.shape[-1]))
 
         if self.deploy_mode:
+            if obb_pred is not None:
+                return labels, boxes, scores, obb_pred
             return labels, boxes, scores
 
         if self.remap_mscoco_category:
@@ -79,11 +90,37 @@ class PostProcessor(nn.Module):
                 .to(boxes.device).reshape(labels.shape)
 
         results = []
-        for lab, box, sco in zip(labels, boxes, scores):
-            result = dict(labels=lab, boxes=box, scores=sco)
-            results.append(result)
+        if obb_pred is None:
+            for lab, box, sco in zip(labels, boxes, scores):
+                result = dict(labels=lab, boxes=box, scores=sco)
+                results.append(result)
+        else:
+            for lab, box, sco, obb, obb_pt in zip(labels, boxes, scores, obb_pred, obb_points):
+                result = dict(labels=lab, boxes=box, scores=sco, obb_boxes=obb, obb_points=obb_pt)
+                results.append(result)
 
         return results
+
+    @staticmethod
+    def _obb_to_corners(obb_boxes: torch.Tensor) -> torch.Tensor:
+        cx, cy, w, h, a = [obb_boxes[..., i] for i in range(5)]
+        half_w, half_h = w / 2.0, h / 2.0
+        base = torch.stack([
+            torch.stack([-half_w, -half_h], dim=-1),
+            torch.stack([half_w, -half_h], dim=-1),
+            torch.stack([half_w, half_h], dim=-1),
+            torch.stack([-half_w, half_h], dim=-1),
+        ], dim=-2)
+        cos_a = torch.cos(a)
+        sin_a = torch.sin(a)
+        rot = torch.stack([
+            torch.stack([cos_a, -sin_a], dim=-1),
+            torch.stack([sin_a, cos_a], dim=-1),
+        ], dim=-2)
+        corners = torch.matmul(base, rot.transpose(-1, -2))
+        corners[..., 0] += cx.unsqueeze(-1)
+        corners[..., 1] += cy.unsqueeze(-1)
+        return corners
 
 
     def deploy(self, ):
