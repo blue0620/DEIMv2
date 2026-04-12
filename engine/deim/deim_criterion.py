@@ -214,6 +214,23 @@ class DEIMCriterion(nn.Module):
 
         return losses
 
+    def loss_obb(self, outputs, targets, indices, num_boxes):
+        if 'pred_obb_boxes' not in outputs:
+            return {'loss_obb': outputs['pred_boxes'].sum() * 0.0}
+        idx = self._get_src_permutation_idx(indices)
+        src_obb = outputs['pred_obb_boxes'][idx]
+        if src_obb.numel() == 0:
+            return {'loss_obb': src_obb.sum() * 0.0}
+
+        target_obb = torch.cat([t['obb_boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        loss_xywh = F.l1_loss(src_obb[:, :4], target_obb[:, :4], reduction='none').sum(dim=-1)
+        angle_delta = torch.atan2(
+            torch.sin(src_obb[:, 4] - target_obb[:, 4]),
+            torch.cos(src_obb[:, 4] - target_obb[:, 4]),
+        ).abs()
+        loss = (loss_xywh + angle_delta).sum() / num_boxes
+        return {'loss_obb': loss}
+
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -255,6 +272,7 @@ class DEIMCriterion(nn.Module):
     def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
         loss_map = {
             'boxes': self.loss_boxes,
+            'obb': self.loss_obb,
             'focal': self.loss_labels_focal,
             'vfl': self.loss_labels_vfl,
             'mal': self.loss_labels_mal,

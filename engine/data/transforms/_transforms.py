@@ -3,6 +3,7 @@ Copied from RT-DETR (https://github.com/lyuwenyu/RT-DETR)
 Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
 
+import math
 import torch
 import torch.nn as nn
 
@@ -135,3 +136,89 @@ class ConvertPILImage(T.Transform):
         inpt = Image(inpt)
 
         return inpt
+
+
+@register()
+class RandomRotateOBB(T.Transform):
+    def __init__(self, degrees=15.0, p=0.5, fill=0) -> None:
+        super().__init__()
+        self.degrees = float(degrees)
+        self.p = p
+        self.fill = fill
+
+    def _build_obb_from_boxes(self, boxes, angle_rad, image_size):
+        if boxes.numel() == 0:
+            return boxes.new_zeros((0, 5))
+        h, w = image_size
+        center = boxes.new_tensor([w / 2.0, h / 2.0])
+        cx = (boxes[:, 0] + boxes[:, 2]) / 2.0
+        cy = (boxes[:, 1] + boxes[:, 3]) / 2.0
+        wh = torch.stack([boxes[:, 2] - boxes[:, 0], boxes[:, 3] - boxes[:, 1]], dim=-1)
+
+        c = math.cos(angle_rad)
+        s = math.sin(angle_rad)
+        rot = boxes.new_tensor([[c, -s], [s, c]])
+        centers = torch.stack([cx, cy], dim=-1)
+        centers = (centers - center) @ rot.T + center
+
+        angles = boxes.new_full((boxes.shape[0], 1), angle_rad)
+        return torch.cat([centers, wh, angles], dim=-1)
+
+    def _rotate_boxes(self, boxes, angle_rad, image_size):
+        if boxes.numel() == 0:
+            return boxes
+        h, w = image_size
+        center = boxes.new_tensor([w / 2.0, h / 2.0])
+        c = math.cos(angle_rad)
+        s = math.sin(angle_rad)
+        rot = boxes.new_tensor([[c, -s], [s, c]])
+
+        corners = torch.stack([
+            boxes[:, [0, 1]],
+            boxes[:, [2, 1]],
+            boxes[:, [2, 3]],
+            boxes[:, [0, 3]],
+        ], dim=1)
+        rotated = (corners - center) @ rot.T + center
+
+        x_min = rotated[..., 0].min(dim=1).values.clamp(min=0, max=w)
+        y_min = rotated[..., 1].min(dim=1).values.clamp(min=0, max=h)
+        x_max = rotated[..., 0].max(dim=1).values.clamp(min=0, max=w)
+        y_max = rotated[..., 1].max(dim=1).values.clamp(min=0, max=h)
+        return torch.stack([x_min, y_min, x_max, y_max], dim=-1)
+
+    def __call__(self, *inputs: Any) -> Any:
+        sample = inputs if len(inputs) > 1 else inputs[0]
+        image, target = sample[:2]
+        angle_rad = 0.0
+        if torch.rand(1) < self.p:
+            angle_deg = float((torch.rand(1) * 2 - 1) * self.degrees)
+            angle_rad = math.radians(angle_deg)
+            image = F.rotate(image, angle=angle_deg, interpolation=F.InterpolationMode.BILINEAR, fill=self.fill)
+            if "boxes" in target:
+                target["boxes"] = self._rotate_boxes(target["boxes"], angle_rad, image.size[::-1])
+
+        if "boxes" in target:
+            target["obb_boxes"] = self._build_obb_from_boxes(target["boxes"], angle_rad, image.size[::-1])
+
+        if len(sample) == 2:
+            return image, target
+        return image, target, *sample[2:]
+
+
+@register()
+class ConvertOBB(T.Transform):
+    def __init__(self, normalize=False) -> None:
+        super().__init__()
+        self.normalize = normalize
+
+    def __call__(self, *inputs: Any) -> Any:
+        sample = inputs if len(inputs) > 1 else inputs[0]
+        image, target = sample[:2]
+        if "obb_boxes" in target and self.normalize:
+            h, w = image.shape[-2], image.shape[-1]
+            scale = target["obb_boxes"].new_tensor([w, h, w, h, 1.0])
+            target["obb_boxes"] = target["obb_boxes"] / scale
+        if len(sample) == 2:
+            return image, target
+        return image, target, *sample[2:]

@@ -155,6 +155,7 @@ class TransformerDecoder(nn.Module):
                 score_head,
                 query_pos_head,
                 pre_bbox_head,
+                obb_angle_head,
                 integral,
                 up,
                 reg_scale,
@@ -169,6 +170,7 @@ class TransformerDecoder(nn.Module):
         dec_out_logits = []
         dec_out_pred_corners = []
         dec_out_refs = []
+        dec_out_obb = []
         if not hasattr(self, 'project'):
             project = weighting_function(self.reg_max, up, reg_scale)
         else:
@@ -197,6 +199,8 @@ class TransformerDecoder(nn.Module):
             # Refine bounding box corners using FDR, integrating previous layer's corrections
             pred_corners = bbox_head[i](output + output_detach) + pred_corners_undetach
             inter_ref_bbox = distance2bbox(ref_points_initial, integral(pred_corners, project), reg_scale)
+            pred_angles = torch.tanh(obb_angle_head[i](output)) * (math.pi / 2.0)
+            pred_obb = torch.cat([inter_ref_bbox, pred_angles], dim=-1)
 
             if self.training or i == self.eval_idx:
                 scores = score_head[i](output)
@@ -206,6 +210,7 @@ class TransformerDecoder(nn.Module):
                 dec_out_bboxes.append(inter_ref_bbox)
                 dec_out_pred_corners.append(pred_corners)
                 dec_out_refs.append(ref_points_initial)
+                dec_out_obb.append(pred_obb)
 
                 if not self.training:
                     break
@@ -215,7 +220,8 @@ class TransformerDecoder(nn.Module):
             output_detach = output.detach()
 
         return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits), \
-               torch.stack(dec_out_pred_corners), torch.stack(dec_out_refs), pre_bboxes, pre_scores
+               torch.stack(dec_out_pred_corners), torch.stack(dec_out_refs), \
+               torch.stack(dec_out_obb), pre_bboxes, pre_scores
 
 
 @register()
@@ -330,6 +336,9 @@ class DEIMTransformer(nn.Module):
         self.dec_bbox_head = nn.ModuleList(
             [dec_bbox_head if share_bbox_head else copy.deepcopy(dec_bbox_head) for _ in range(self.eval_idx + 1)]
           + [MLP(scaled_dim, scaled_dim, 4 * (self.reg_max+1), 3, act=mlp_act) for _ in range(num_layers - self.eval_idx - 1)])
+        self.dec_obb_angle_head = nn.ModuleList(
+            [MLP(hidden_dim, hidden_dim, 1, 3, act=mlp_act) for _ in range(self.eval_idx + 1)]
+          + [MLP(scaled_dim, scaled_dim, 1, 3, act=mlp_act) for _ in range(num_layers - self.eval_idx - 1)])
 
         # init encoder output anchors and valid_mask
         if self.eval_spatial_size:
@@ -348,6 +357,9 @@ class DEIMTransformer(nn.Module):
         self.dec_bbox_head = nn.ModuleList(
             [self.dec_bbox_head[i] if i <= self.eval_idx else nn.Identity() for i in range(len(self.dec_bbox_head))]
         )
+        self.dec_obb_angle_head = nn.ModuleList(
+            [self.dec_obb_angle_head[i] if i <= self.eval_idx else nn.Identity() for i in range(len(self.dec_obb_angle_head))]
+        )
 
     def _reset_parameters(self, feat_channels):
         bias = bias_init_with_prob(0.01)
@@ -358,11 +370,14 @@ class DEIMTransformer(nn.Module):
         init.constant_(self.pre_bbox_head.layers[-1].weight, 0)
         init.constant_(self.pre_bbox_head.layers[-1].bias, 0)
 
-        for cls_, reg_ in zip(self.dec_score_head, self.dec_bbox_head):
+        for cls_, reg_, obb_ in zip(self.dec_score_head, self.dec_bbox_head, self.dec_obb_angle_head):
             init.constant_(cls_.bias, bias)
             if hasattr(reg_, 'layers'):
                 init.constant_(reg_.layers[-1].weight, 0)
                 init.constant_(reg_.layers[-1].bias, 0)
+            if hasattr(obb_, 'layers'):
+                init.constant_(obb_.layers[-1].weight, 0)
+                init.constant_(obb_.layers[-1].bias, 0)
 
         if self.learn_query_content:
             init.xavier_uniform_(self.tgt_embed.weight)
@@ -544,7 +559,7 @@ class DEIMTransformer(nn.Module):
             self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
 
         # decoder
-        out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits = self.decoder(
+        out_bboxes, out_logits, out_corners, out_refs, out_obb_boxes, pre_bboxes, pre_logits = self.decoder(
             init_ref_contents,
             init_ref_points_unact,
             memory,
@@ -553,6 +568,7 @@ class DEIMTransformer(nn.Module):
             self.dec_score_head,
             self.query_pos_head,
             self.pre_bbox_head,
+            self.dec_obb_angle_head,
             self.integral,
             self.up,
             self.reg_scale,
@@ -569,22 +585,23 @@ class DEIMTransformer(nn.Module):
 
             dn_out_corners, out_corners = torch.split(out_corners, dn_meta['dn_num_split'], dim=2)
             dn_out_refs, out_refs = torch.split(out_refs, dn_meta['dn_num_split'], dim=2)
+            dn_out_obb_boxes, out_obb_boxes = torch.split(out_obb_boxes, dn_meta['dn_num_split'], dim=2)
 
         if self.training:
             out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1], 'pred_corners': out_corners[-1],
-                   'ref_points': out_refs[-1], 'up': self.up, 'reg_scale': self.reg_scale}
+                   'ref_points': out_refs[-1], 'pred_obb_boxes': out_obb_boxes[-1], 'up': self.up, 'reg_scale': self.reg_scale}
         else:
-            out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1]}
+            out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1], 'pred_obb_boxes': out_obb_boxes[-1]}
 
         if self.training and self.aux_loss:
-            out['aux_outputs'] = self._set_aux_loss2(out_logits[:-1], out_bboxes[:-1], out_corners[:-1], out_refs[:-1],
+            out['aux_outputs'] = self._set_aux_loss2(out_logits[:-1], out_bboxes[:-1], out_corners[:-1], out_refs[:-1], out_obb_boxes[:-1],
                                                      out_corners[-1], out_logits[-1])
             out['enc_aux_outputs'] = self._set_aux_loss(enc_topk_logits_list, enc_topk_bboxes_list)
             out['pre_outputs'] = {'pred_logits': pre_logits, 'pred_boxes': pre_bboxes}
             out['enc_meta'] = {'class_agnostic': self.query_select_method == 'agnostic'}
 
             if dn_meta is not None:
-                out['dn_outputs'] = self._set_aux_loss2(dn_out_logits, dn_out_bboxes, dn_out_corners, dn_out_refs,
+                out['dn_outputs'] = self._set_aux_loss2(dn_out_logits, dn_out_bboxes, dn_out_corners, dn_out_refs, dn_out_obb_boxes,
                                                         dn_out_corners[-1], dn_out_logits[-1])
                 out['dn_pre_outputs'] = {'pred_logits': dn_pre_logits, 'pred_boxes': dn_pre_bboxes}
                 out['dn_meta'] = dn_meta
@@ -601,11 +618,11 @@ class DEIMTransformer(nn.Module):
 
 
     @torch.jit.unused
-    def _set_aux_loss2(self, outputs_class, outputs_coord, outputs_corners, outputs_ref,
+    def _set_aux_loss2(self, outputs_class, outputs_coord, outputs_corners, outputs_ref, outputs_obb,
                        teacher_corners=None, teacher_logits=None):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
-        return [{'pred_logits': a, 'pred_boxes': b, 'pred_corners': c, 'ref_points': d,
+        return [{'pred_logits': a, 'pred_boxes': b, 'pred_corners': c, 'ref_points': d, 'pred_obb_boxes': e,
                      'teacher_corners': teacher_corners, 'teacher_logits': teacher_logits}
-                for a, b, c, d in zip(outputs_class, outputs_coord, outputs_corners, outputs_ref)]
+                for a, b, c, d, e in zip(outputs_class, outputs_coord, outputs_corners, outputs_ref, outputs_obb)]
