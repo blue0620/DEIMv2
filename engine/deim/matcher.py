@@ -8,6 +8,7 @@ Copyright (c) 2024 The D-FINE Authors All Rights Reserved.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision
 
 from scipy.optimize import linear_sum_assignment
 from typing import Dict
@@ -42,6 +43,8 @@ class HungarianMatcher(nn.Module):
         self.cost_class = weight_dict['cost_class']
         self.cost_bbox = weight_dict['cost_bbox']
         self.cost_giou = weight_dict['cost_giou']
+        self.cost_angle = weight_dict.get('cost_angle', 0.0)
+        self.cost_riou = weight_dict.get('cost_riou', 0.0)
 
         self.change_matcher = change_matcher
         self.iou_order_alpha = iou_order_alpha
@@ -53,7 +56,31 @@ class HungarianMatcher(nn.Module):
         self.alpha = alpha
         self.gamma = gamma
 
-        assert self.cost_class != 0 or self.cost_bbox != 0 or self.cost_giou != 0, "all costs cant be 0"
+        assert self.cost_class != 0 or self.cost_bbox != 0 or self.cost_giou != 0 or self.cost_angle != 0 or self.cost_riou != 0, "all costs cant be 0"
+
+    def _angle_cost(self, pred_angle: torch.Tensor, tgt_angle: torch.Tensor):
+        """Periodic smooth-L1 angle cost for OBB matching."""
+        angle_delta = pred_angle[:, None] - tgt_angle[None, :]
+        # Periodicity-aware transform: equivalent angles (e.g. theta and theta + 2pi)
+        # have zero gap after applying sin.
+        periodic_delta = torch.sin(angle_delta)
+        return F.smooth_l1_loss(
+            periodic_delta,
+            torch.zeros_like(periodic_delta),
+            reduction='none',
+            beta=1.0,
+        )
+
+    def _rotated_iou_cost(self, out_bbox: torch.Tensor, tgt_bbox: torch.Tensor):
+        if not hasattr(torchvision.ops, 'box_iou_rotated'):
+            return None
+
+        out_bbox_riou = out_bbox[:, :5].clone()
+        tgt_bbox_riou = tgt_bbox[:, :5].clone()
+        # torchvision.ops.box_iou_rotated expects angle in degrees.
+        out_bbox_riou[:, 4] = torch.rad2deg(out_bbox_riou[:, 4])
+        tgt_bbox_riou[:, 4] = torch.rad2deg(tgt_bbox_riou[:, 4])
+        return -torchvision.ops.box_iou_rotated(out_bbox_riou, tgt_bbox_riou)
 
     @torch.no_grad()
     def forward(self, outputs: Dict[str, torch.Tensor], targets, return_topk=False, epoch=0):
@@ -112,13 +139,34 @@ class HungarianMatcher(nn.Module):
                 cost_class = -out_prob[:, tgt_ids]
 
             # Compute the L1 cost between boxes
-            cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
+            is_obb = out_bbox.shape[-1] >= 5 and tgt_bbox.shape[-1] >= 5
+            if is_obb:
+                # Keep xywh regression distance for bbox cost to avoid duplicating angle cost.
+                cost_bbox = torch.cdist(out_bbox[:, :4], tgt_bbox[:, :4], p=1)
+            else:
+                cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
 
             # Compute the giou cost betwen boxes
-            cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
+            if is_obb:
+                cost_giou = -generalized_box_iou(
+                    box_cxcywh_to_xyxy(out_bbox[:, :4]),
+                    box_cxcywh_to_xyxy(tgt_bbox[:, :4]),
+                )
+            else:
+                cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
+
+            cost_angle = 0.0
+            cost_riou = 0.0
+            if is_obb:
+                cost_angle = self._angle_cost(out_bbox[:, 4], tgt_bbox[:, 4])
+                riou = self._rotated_iou_cost(out_bbox, tgt_bbox)
+                if riou is not None:
+                    cost_riou = riou
 
             # Final cost matrix 3 * self.cost_bbox + 2 * self.cost_class + self.cost_giou
             C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
+            if is_obb:
+                C = C + self.cost_angle * cost_angle + self.cost_riou * cost_riou
 
         C = C.view(bs, num_queries, -1).cpu()
 
